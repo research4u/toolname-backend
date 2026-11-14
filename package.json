@@ -1,0 +1,47 @@
+{
+  "name": "toolname-backend",
+  "version": "2.0.0",
+  "description": "",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "test": "NODE_OPTIONS=--experimental-vm-modules jest",
+    "start": "node src/server.js",
+    "dev": "nodemon src/server.js",
+    "antlr": "node src/transpilers/2.1-beta/grammar/generate-grammars.mjs",
+    "antlr:2.0": "node src/transpilers/2.0/grammar/generate-grammars.mjs",
+    "format": "prettier --write \"**/*.js\""
+  },
+  "imports": {
+    "#root/*.js": "./*.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/research4u/toolname-backend.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "bugs": {
+    "url": "https://github.com/research4u/toolname-backend/issues"
+  },
+  "homepage": "https://github.com/research4u/toolname-backend#readme",
+  "dependencies": {
+    "antlr4": "^4.13.2",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "multer": "^2.2.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.29.7",
+    "babel-jest": "^30.4.1",
+    "esm": "^3.2.25",
+    "jest": "^30.4.2",
+    "nodemon": "^3.1.14",
+    "prettier": "^3.9.5"
+  },
+  "allowScripts": {
+    "fsevents@2.3.3": true,
+    "unrs-resolver@1.12.2": true
+  }
+}

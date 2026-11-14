@@ -1,0 +1,605 @@
+# COMMANDS
+
+This tutorial explains how to add or change an AMOS command in transpiler `2.0`
+(`src/transpilers/2.0/`).
+
+Sections 3 and 4 walk through two commands that are already implemented: `PLOT`, an instruction,
+and `ABS`, a function. They follow each step of the implementation and explain the reasoning
+behind it, so you can apply the same logic to a new command and compare every step with the
+real code.
+
+Paths in this tutorial are relative to `src/transpilers/2.0/`, and `npm` commands run
+from the backend root.
+
+1. [How the transpiler works](#1-how-the-transpiler-works)
+2. [Where is a command?](#2-where-is-a-command)
+3. [Walkthrough: an instruction (`PLOT`)](#3-walkthrough-an-instruction-plot)
+4. [Walkthrough: a function (`ABS`)](#4-walkthrough-a-function-abs)
+5. [Reading a command's parameters](#5-reading-a-commands-parameters)
+6. [The browser side: the DOM and the runtime](#6-the-browser-side-the-dom-and-the-runtime)
+7. [The first command of a new category](#7-the-first-command-of-a-new-category)
+8. [Modify an existing command](#8-modify-an-existing-command)
+9. [Helper reference](#9-helper-reference)
+10. [Pitfalls](#10-pitfalls)
+11. [Checklist](#11-checklist)
+
+## 1. How the transpiler works
+
+Parsing still completes before translation starts. `AMOSTranspiler` then builds fresh
+translation services for this program:
+
+```js
+const dispatcher = new HandlerDispatcher();
+const expressions = new ExpressionTranslator(dispatcher);
+const context = new TranslationContext(expressions);
+dispatcher.registerHandlers([
+  new Instructions(context),
+  new Structures(context),
+  new Functions(context),
+]);
+const translator = new AMOSTranslator(context, dispatcher);
+walker.walk(translator, tree);
+const javaScript = context.getJavaScript();
+```
+
+Registration finishes before the walker runs. Handlers share the context and expression
+translator; their constructors do not start translation.
+
+```mermaid
+flowchart TD
+    Source[Validated AMOS tree] --> Listener[AMOSTranslator: enter and exit events]
+    Listener --> Dispatch[HandlerDispatcher: bound command methods]
+    Dispatch --> Handlers[Core command handlers]
+    Listener --> Mini[Extension translate node, context]
+    Mini --> Local[Extension dispatcher and handlers]
+    Handlers --> Expressions[ExpressionTranslator: expression syntax]
+    Local --> Expressions
+    Expressions -->|Function rules| Dispatch
+    Handlers --> Context[TranslationContext: state and output]
+    Local --> Context
+    Context --> Output[Assemble JavaScript, then format]
+```
+
+Nested functions recurse through `ExpressionTranslator` and their handlers. They do not
+call the statement listener. Imported grammars use the same expression translator because
+rule lookup uses each node's owning parser, rather than generated context classes.
+Expression handlers are named `translateX`, return JavaScript source text, and are resolved
+through `dispatcher.getExpressionHandler(node)`. They use the shared expression service
+for recursion; no generated ANTLR visitor is involved.
+
+| Path | Responsibility |
+| --- | --- |
+| `amos-transpiler.js` | Parse, assemble services, walk, format; return diagnostics and JavaScript |
+| `core/amos-translator.js` | Forward tree events and invoke accepted extensions in their active scope |
+| `core/translation-context.js` | Own program state, declarations, output sections, runtime inclusion, and assembly |
+| `core/expression-translator.js` | Translate expression syntax and call function handlers directly |
+| `core/handler-dispatcher.js` | Discover and bind `enterX`, `exitX`, and `translateX` methods once per handler set |
+| `commands/` | Command semantics, one file per category |
+| `grammar/AMOS.g4`, `grammar/generated/` | Grammar and generated ANTLR code; generate rather than edit the latter |
+| `grammar/generate-grammars.mjs` | Development tool invoked by `npm run antlr` to generate and format core and extension parsers |
+| `core/amos-runtime.js` | Browser runtime included in generated programs |
+| `core/amos-error-listener.js` | Collect lexical and syntax errors |
+| `extensions/` | Extension discovery, statement integration, and independent mini-transpilers |
+| `tests/` | Command, architecture, and runtime integration checks |
+
+`amos-transpiler.js` is the public entry point at the version root. Shared translation
+services live in `core/`, command implementations in `commands/`, and parsing definitions
+and tooling in `grammar/`. The generator runs during development, not during transpilation.
+
+## 2. Where is a command?
+
+Every AMOS command lives in one place, decided by its **category**: the `CATEGORY` column of
+the tracking spreadsheet (`ToolName - AMOS Basic Tracking.xlsx`), which follows the official
+[AMOS Professional command index](https://amospromanual.dev/99-appendix-g-command-index.html).
+The spreadsheet also has the documentation link of each command.
+
+1. Look the command up in the spreadsheet and read its category, e.g. `PALETTE` → Instruction.
+2. The file is the category in kebab-case plural: `commands/instructions.js`.
+3. Inside the file, commands are sorted **A-Z by AMOS name**, each under a comment with that name:
+   ```js
+   // PALETTE
+   enterPalette(ctx) {
+   ```
+4. The same comment, at the same A-Z position, is above the command's rule in `grammar/AMOS.g4`,
+   under the category heading.
+
+To find a command, search for its name in capitals, e.g. `// PALETTE`: you get both its grammar
+rule and its translation.
+
+**Method names.** A method is named after the grammar rule it translates.
+`HandlerDispatcher.registerHandlers()` discovers these methods on registered handler
+instances; adding a method needs no separate registration:
+
+| Method | What it does | Example |
+| --- | --- | --- |
+| `enterX(ctx)` | Instructions and structures: emits JavaScript when the walker enters rule `x` | rule `cls` → `enterCls` |
+| `exitX(ctx)` | End of a block (`Loop`, `Next`, `End If`…): emits JavaScript when the walker leaves rule `x` | rule `doLoop` → `exitDoLoop` |
+| `translateX(ctx)` | Functions: **returns** the JavaScript that replaces the call inside an expression | rule `absFunction` → `translateAbsFunction` |
+
+The rule name is not always the AMOS name (`DIM` → rule `arrayDeclaration` →
+`enterArrayDeclaration`): that is why each method has the `// DIM` comment above it.
+
+| Category                           | File in `commands/` |
+| ---------------------------------- | ------------------- |
+| Instruction                        | `instructions.js`   |
+| Structure                          | `structures.js`     |
+| Function                           | `functions.js`      |
+| AMCAF extension (not in the index) | `amcaf.js`          |
+
+The other categories have no translated command yet. Their file is created, with the same
+naming rule, when the first command is implemented
+([section 7](#7-the-first-command-of-a-new-category)):
+
+- Interface Instruction, Interface Function, Interface Structure → `interface-instructions.js`,
+  `interface-functions.js`, `interface-structures.js`
+- AMAL Instruction, AMAL Function, AMAL Structure → `amal-instructions.js`, `amal-functions.js`,
+  `amal-structures.js`
+- Embedded Menu Command → `embedded-menu-commands.js`
+- Reserved Variable → `reserved-variables.js`
+- System Function → `system-functions.js`
+- Picture Compactor Extension → `picture-compactor-extension.js`
+
+**Edge cases** (each one is also explained by a comment in the code):
+
+- `PRINT #` is a Structure, but it shares the grammar rule of `PRINT`, so it is translated in
+  `instructions.js` under `PRINT`.
+- `STEP` is a Structure, but it is part of the grammar rule of `FOR` (`For I=1 To 9 Step 2`), so
+  it is translated in `structures.js` under `FOR ... NEXT`.
+- `COLOUR` is both an Instruction (`Colour 1,$A74`, rule `colour`) and a Function
+  (`C=Colour(1)`, rule `colourFunction`), as in the command index. Each form is translated in the
+  file of its category, under `// COLOUR`.
+- `KEY STATE` is a Function, but the grammar only accepts it as the condition of `If` / `While`,
+  so it is translated in `structures.js` under `IF KEY STATE` and `WHILE`.
+- `NOT` and `FN` are Structures, but they return a value inside an expression (`X = Not Y`,
+  `Print Fn X(1,10,100)`), so their rules are listed in `factor:` and they are translated by
+  `translateX` methods in `structures.js`.
+- Variable and array assignments (`X = 1`, `A(1) = 2`) and labels have no category. They are at
+  the end of `structures.js` and of the Structures part of `AMOS.g4`, under _Not in the command
+  index_.
+- Commands that are not in the index come from an extension (today only AMCAF) and go in that
+  extension's file.
+
+## 3. Walkthrough: an instruction (`PLOT`)
+
+`PLOT` is already implemented, exactly as shown here. This section follows each step of its
+implementation and explains the reasoning, so you can repeat the same steps for a new instruction.
+
+`Plot x,y` draws a point. The spreadsheet says: `PLOT`, category Instruction, documented at
+`https://amospromanual.dev/06-04-graphics.html#i-plot`. So it goes in `commands/instructions.js`,
+and alphabetically between `PLAY` and `PRINT` everywhere.
+
+### Step 1: grammar
+
+The grammar rule describes the syntax: the keyword `Plot`, then two expressions separated by a
+comma. It is in `grammar/AMOS.g4`, under `// ---- Instructions ----`, between `// PLAY` and
+`// PRINT`:
+
+```antlr
+// PLOT
+plot:
+    PLOT expression COMMA expression
+    ;
+```
+
+Define its named lexer token in the Keywords section, above `IDENTIFIER`:
+
+```antlr
+PLOT: 'Plot';
+```
+
+Both AMOS and AMCAF use `options { caseInsensitive = true; }`. Every parser rule
+references named tokens, including operators and punctuation; quoted spellings belong
+in lexer rules only. Keyword token names use `UPPER_SNAKE_CASE` and are sorted A-Z.
+Fixed multi-word commands are single tokens with horizontal whitespace between words:
+
+```antlr
+SCREEN_SWAP: 'Screen' HSPACE 'Swap' KEYWORD_BOUNDARY;
+```
+
+`HSPACE` accepts one or more spaces or tabs, never a newline. The boundary prevents
+matching the beginning of a longer identifier, such as `Screen Swapped`. Modifiers
+and keywords separated by arguments remain separate tokens (`ON ... GOSUB`).
+
+Each parameter is an `expression`, so `Plot X+1,Y*2` and `Plot A(I),10` work too. The `COMMA`
+between them is required (see [Pitfalls](#10-pitfalls)).
+
+The rule is also added at the **end** of the `statement:` alternatives, so that a `Plot` line is
+recognized as a statement:
+
+```antlr
+    | exitLoop
+    | plot
+    ;
+```
+
+ANTLR resolves ambiguities in favour of the alternative listed first, so appending keeps the
+behaviour of the existing commands.
+
+### Step 2: regenerate the parser
+
+From the backend root (Java must be installed):
+
+```bash
+npm run antlr
+```
+
+The npm command invokes `grammar/generate-grammars.mjs`. It regenerates AMOS first,
+discovers `.g4` files in immediate extension subdirectories, provides the core grammar import
+path, and formats the generated JavaScript with Prettier. Regenerate after changing any
+grammar; changing only a handler requires no regeneration. Include the generated files
+alongside the grammar changes when preparing a commit.
+Generation uses `-no-visitor` and removes stale visitor files: expression translation lives
+in `ExpressionTranslator` and the `translateX` handlers.
+The parser now has a rule `plot` and a `PlotContext` class for its nodes
+([section 5](#5-reading-a-commands-parameters)).
+
+### Step 3: translation
+
+In `commands/instructions.js`, between `PLAY` and `PRINT`:
+
+```js
+  // PLOT
+  enterPlot(ctx) {
+    const x = this.expressions.translate(ctx.expression(0));
+    const y = this.expressions.translate(ctx.expression(1));
+
+    this.context.emit(`
+{
+const plotDiv = document.createElement('div');
+plotDiv.style.position = 'absolute';
+plotDiv.style.left = (${x}) + 'px';
+plotDiv.style.top = (${y}) + 'px';
+plotDiv.style.width = '1px';
+plotDiv.style.height = '1px';
+plotDiv.style.backgroundColor = getColour(Ink);
+document.getElementById('amos-screen').appendChild(plotDiv);
+}`);
+  }
+```
+
+The method has two parts: it reads the parameters, then it emits the JavaScript that does the
+work in the browser.
+
+- **The name.** `enterPlot` comes from the rule `plot`: the translator finds the method by this
+  name and calls it for every `Plot` in the program.
+- **Reading the parameters.** The rule has two `expression`s, so `ctx.expression(0)` is the first
+  one (x) and `ctx.expression(1)` the second (y). `this.expressions.translate(...)` translates each into
+  JavaScript (`X+1` → `X + 1`). Each one is named first (`const x = …`), then the template uses
+  the names, so it stays flat and easy to read. [Section 5](#5-reading-a-commands-parameters)
+  covers every kind of parameter.
+- **The emitted JavaScript.** It runs in the browser, where it draws a 1×1 pixel `div` at (x, y)
+  on the AMOS screen (`#amos-screen`), in the current ink colour. `getColour` and `Ink` come from
+  `core/amos-runtime.js`, which is part of every generated program.
+  [Section 6](#6-the-browser-side-the-dom-and-the-runtime) explains the DOM and the runtime.
+- **The braces `{ … }`.** A program can contain many `Plot`s: the block keeps each `const plotDiv`
+  separate.
+- **The parentheses in `(${x}) + 'px'`.** They keep the expression together, whatever it
+  contains. Prettier removes them when they are not needed.
+
+### Step 4: test
+
+The test is in `tests/plot.spec.js`:
+
+```js
+import AMOSTranspiler from '../amos-transpiler.js';
+
+test('plot translation', async () => {
+  const { lexicalErrors, syntaxErrors, translatedCode } = await new AMOSTranspiler().transpile(
+    'Plot 10,20',
+  );
+
+  expect(lexicalErrors.errors).toEqual([]);
+  expect(syntaxErrors.errors).toEqual([]);
+  expect(translatedCode).toContain("plotDiv.style.left = 10 + 'px';");
+  expect(translatedCode).toContain("plotDiv.style.top = 20 + 'px';");
+});
+```
+
+Run `npm test`. `translatedCode` has been formatted by prettier, so the test compares against the
+formatted code: `(10) + 'px'` becomes `10 + 'px'`.
+
+### Step 5: spreadsheet
+
+Set `GRAMMAR SUPPORT`, `SEMANTIC SUPPORT` and `TESTS` to `Y` for `PLOT`.
+
+## 4. Walkthrough: a function (`ABS`)
+
+`ABS` is already implemented, exactly as shown here. This section follows its steps.
+
+A function returns a value inside an expression (`X = Abs(-3) + 1`). Compared with an
+instruction, there are two differences:
+
+- its grammar rule is also listed in `factor:`, the part of an expression a function call can
+  appear in;
+- its method is `translateX`, and it **returns** JavaScript instead of emitting it, because the
+  expression around the call needs the value.
+
+The spreadsheet says: `ABS`, category Function, documented at
+`https://amospromanual.dev/05-03-maths.html#fn-abs`. So it goes in `commands/functions.js`,
+alphabetically before `COS`.
+
+**Step 1: grammar.** In `grammar/AMOS.g4`, under `// ---- Functions ----`, before `// BTST`:
+
+```antlr
+// ABS
+absFunction:
+    ABS ROUND_BRACKET_OPEN expression ROUND_BRACKET_CLOSE
+    ;
+```
+
+It is also listed next to the other functions in `factor:`:
+
+```antlr
+    | rndFunction
+    | absFunction
+```
+
+**Step 2:** `npm run antlr`.
+
+**Step 3: translation.** In `commands/functions.js`, before `COS`:
+
+```js
+  // ABS
+  translateAbsFunction(ctx) {
+    const value = this.expressions.translate(ctx.expression());
+    return `Math.abs(${value})`;
+  }
+```
+
+The rule has a single `expression`, so `ctx.expression()` takes no position
+([section 5](#5-reading-a-commands-parameters)). The method returns `Math.abs(…)`, and the
+expression translator puts it where the call was: `X = Abs(-3) + 1` becomes `X = Math.abs(-3) + 1;`.
+A function usually needs no DOM code.
+
+`this.expressions.translate(...)` returns JavaScript source text, such as `Y_f + 1`, whose value is only known
+when the generated program runs. Emit the numeric operation around that text, for example
+`Math.exp(${value})`; do not evaluate it with `Number(...)`, `Number.isFinite(...)`, or a math
+function during transpilation. Each handler's constructor stores its shared context and expression service;
+handlers call it directly with `this.expressions.translate(...)`. `Exp`, `Ln`, `Log`, `Sqr`,
+`Hcos`, `Hsin`, and `Htan` emit native JavaScript `Math` calls, including their runtime `NaN`
+and infinity behavior for invalid domains and overflow.
+
+**Step 4: test.** `tests/abs.spec.js` checks that `X = Abs(-3)` becomes `X = Math.abs(-3);`.
+
+**Step 5:** update the spreadsheet.
+
+## 5. Reading a command's parameters
+
+A command method receives `ctx`, the node of the parse tree for that command. ANTLR generates
+one method on `ctx` for each part of the grammar rule, named after the part (`expression`,
+`NUMBER`, `IDENTIFIER`, `STRING`…). These methods are how you read the parameters.
+
+**One part, or several of the same kind.** If a part appears once in the rule, its method
+returns it directly: `ctx.expression()` in `ABS`. If it appears several times, give its position,
+counting from 0 in the order of the rule: `ctx.expression(0)`, `ctx.expression(1)` in `PLOT`.
+Without a position, you get all of them as an array (`ctx.expression().length`).
+
+**What each kind of part gives you:**
+
+- **`expression`**: always translate it with `this.expressions.translate(…)`. Don't use `getText()` on it: that
+  returns the AMOS source (`A(1)+Abs(X)`), not JavaScript (`A[Math.trunc(1)] + Math.abs(X)`).
+- **Tokens**, the names in capitals (`NUMBER`, `STRING`, `IDENTIFIER`, `HEX_NUMBER`): `.getText()`
+  returns their text as written. A `STRING` keeps its quotes (`"Hello"`), so it is already a
+  JavaScript string. An `IDENTIFIER` is a name, such as the variable of `ADD`.
+- **Floats**: a `NUMBER` can be decimal (`3.14`). A float variable (`A#`) is the one name not
+  returned as written: `#` is not valid in JavaScript, so `amos-transpiler.js` renames `A#` to `A_f`
+  before the translation, and `.getText()` returns `A_f`. Commands need nothing special for it.
+- **Strings**: a string variable (`A$`) keeps its name, since `$` is valid in JavaScript.
+  `this.context.declareVariable` gives it `""` instead of `0`.
+- **Other rules** (`printItem`, `arrayStructure`…) have their own methods: `PRINT` reads
+  `ctx.printItem(0).expression()`.
+- **Keywords and punctuation** (`'Plot'`, `COMMA`, `TO`) are parts too (`ctx.COMMA()`), but you
+  rarely need them.
+
+**Examples from existing commands** (simplified):
+
+```js
+// absFunction: ABS ROUND_BRACKET_OPEN expression ROUND_BRACKET_CLOSE
+const value = this.expressions.translate(ctx.expression()); // the only expression
+
+// plot: PLOT expression COMMA expression
+const x = this.expressions.translate(ctx.expression(0)); // first expression
+const y = this.expressions.translate(ctx.expression(1)); // second expression
+
+// wait: 'Wait' NUMBER
+const ticks = ctx.NUMBER().getText(); // "50"
+
+// text: TEXT expression COMMA expression COMMA (STRING | IDENTIFIER)
+const text = (ctx.STRING() || ctx.IDENTIFIER()).getText(); // "Hello", or a variable name
+
+// add: ADD IDENTIFIER COMMA expression (COMMA expression TO expression)?
+const variable = ctx.IDENTIFIER().getText();
+const amount = this.expressions.translate(ctx.expression(0));
+if (ctx.expression().length > 1) {
+  // The optional part is there: Add X,1,0 To 9
+  const start = this.expressions.translate(ctx.expression(1));
+  const end = this.expressions.translate(ctx.expression(2));
+}
+```
+
+**Optional parts.** A part inside `( … )?` may be missing: its method then returns `null`, or a
+shorter array. Check before using it, as `ADD` does with `ctx.expression().length`.
+`this.expressions.translate(null)` returns `''`, which would silently produce broken JavaScript.
+
+**Avoid `ctx.children[i]`.** The children include every keyword and comma, and their positions
+change when the rule changes. Some older commands still read their parameters this way.
+
+**Name each parameter first** (`const x = …`), then build the JavaScript with these names: the
+template stays flat and easy to read.
+
+**Finding the exact methods.** They are in the rule's `Context` class in
+`grammar/generated/AMOSParser.js` (rule `plot` → `class PlotContext`). While debugging,
+`console.log(ctx.getText())` prints the AMOS source of the whole command.
+
+## 6. The browser side: the DOM and the runtime
+
+The JavaScript you emit runs in the browser. The frontend (`toolname-frontend`,
+`src/app/components/cina/amos-runner.js`) runs the generated program in an `iframe` whose page
+contains `<div id="game-container">`. Most instructions do their work by creating or changing
+HTML elements (the DOM), so writing a command often means writing DOM code.
+
+**The AMOS screen.** `SCREEN OPEN` creates `<div id="amos-screen">` inside `#game-container`.
+Drawing commands add their elements to `#amos-screen`, with `position: absolute` and `left` /
+`top` in pixels, which are the AMOS coordinates. Before writing a new command, look at how the
+existing ones handle the same need:
+
+- **Draw something new each time:** `PLOT` creates a `div` and appends it to `#amos-screen`.
+- **Update the same element when the command runs again**, for example in a loop: `BAR`, `BOX`,
+  `CIRCLE` and `TEXT` give their element an id built from the parameters (`Bar_10_20`), and reuse
+  it if it already exists.
+- **Clear:** `CLS` empties `#amos-screen`. `CLS` with a rectangle, and `BLITTER CLEAR`, remove the
+  elements whose `left` / `top` fall inside the rectangle.
+- **Colours:** `getColour(Ink)` is the current ink colour, and `colorMapping[Paper]` the paper
+  colour. `colorMapping` holds the default colours, or the ones set by `PALETTE`.
+- **Layers:** `zIndex` decides what is drawn on top: shapes use 10, `TEXT` 99, `PRINT` 999,
+  `TURBO DRAW` 1000 and more, sprites 99999.
+- **Waiting:** never block the browser. `WAIT` emits `await new Promise((r) => setTimeout(r, ms))`,
+  and `DO … LOOP` waits 16 ms on each turn so the page can repaint. This works because the
+  frontend runs the program inside an `async` function.
+- **Wrap the emitted code in `{ … }`** when it declares variables, as every drawing command does:
+  the same command can appear many times in a program, and two `const plotDiv` in the same scope
+  are an error.
+
+**Check `core/amos-runtime.js` first.** It is included in every generated program, so the
+code you emit can use its variables and functions directly. Before writing new browser code,
+look for what is already there:
+
+| In the runtime                                                     | What it is                                         | Used by                                              |
+| ------------------------------------------------------------------ | -------------------------------------------------- | ---------------------------------------------------- |
+| `Ink`, `Paper`, `getColour(index)`                                 | The current colours                                | `INK`, `PEN`, `PAPER`, drawing commands              |
+| `keyMapping`, `currentPressedKey`                                  | Keyboard: AMOS scan codes, and the key pressed now | `IF KEY STATE`, `WHILE`                              |
+| `soundPlayer(note, delay)`                                         | Plays a note with the Web Audio API                | `PLAY`                                               |
+| `bankData`, `loadBank(name, bank)`, `renderSprite(n, x, y, image)` | Sprite banks (`.abk`), drawn on a `canvas`         | `LOAD`, `SPRITE`                                     |
+| `openFile`, `writeToChannel`, `readFromChannel`, `closeChannel`    | File channels                                      | `OPEN IN`, `OPEN OUT`, `PRINT #`, `INPUT #`, `CLOSE` |
+| `dataMatrixPointer`, `Timer`                                       | Position of the next `READ`, and the timer         | `READ`, `REPEAT … UNTIL`                             |
+| `Qsin`, `Qcos`                                                   | AMCAF trigonometry helpers                          | `QSIN`, `QCOS`                                       |
+| `Rnd`                                                            | Random number helper                                | Not used by the translator yet                       |
+
+`core/translation-context.js` also adds the Amiga colour helpers of `src/utils/amiga-color.js` to every
+program.
+
+**When to add to the runtime.** If the code you would emit is long, or several commands need it,
+write a function in the runtime and emit a short call, as `PLAY` (`soundPlayer`) and `SPRITE`
+(`renderSprite`) do. The command method stays short, and the logic is written once.
+
+**Seeing the result.** Tests check the generated text. To see a command work, run a program that
+uses it in the frontend.
+
+## 7. The first command of a new category
+
+Example: the first Interface Instruction.
+
+1. Create `commands/interface-instructions.js` (category in kebab-case plural):
+
+   ```js
+   /** AMOS commands of the category "Interface Instruction", sorted A-Z by AMOS name. */
+   export default class InterfaceInstructions {
+     constructor(context) {
+       this.context = context;
+       this.expressions = context.expressions;
+     }
+
+     // COMMAND NAME
+     enterRuleName(ctx) {
+       this.context.emit('...');
+     }
+   }
+   ```
+
+2. In `amos-transpiler.js`, import the class and add an instance to the core registration:
+
+   ```js
+   dispatcher.registerHandlers([
+     new Instructions(context),
+     new Structures(context),
+     new Functions(context),
+     new InterfaceInstructions(context),
+   ]);
+   ```
+
+   Individual commands need no registration: the dispatcher discovers their conventional
+   method names. Duplicate handlers for the same phase and rule are programming errors.
+   Extension handlers use their own local dispatcher instead of this core list; see
+   [EXTENSIONS.md](EXTENSIONS.md).
+
+3. In `grammar/AMOS.g4`, add the category heading and its parser rules using the existing
+   category order, plus named keyword tokens in the lexer section.
+
+Then continue as in [section 3](#3-walkthrough-an-instruction-plot).
+
+## 8. Modify an existing command
+
+1. Find it: search for its name in capitals, e.g. `// CLS`.
+2. Change its method in `commands/`. If the AMOS syntax changes (for example a new optional
+   parameter), change the rule under `// CLS` in `grammar/AMOS.g4` and run
+   `npm run antlr`.
+3. Update the command's test (e.g. `tests/cls.spec.js`) and run `npm test`.
+
+## 9. Helper reference
+
+Inside a method of a command file:
+
+| Access | What it does |
+| --- | --- |
+| `this.expressions.translate(ctx)` | Returns JavaScript for a node; a missing node gives `''`, a list gives translated elements |
+| `this.context.emit(code)` | Appends JavaScript to the program body |
+| `this.context.declareVariable(name)` | Declares a variable once in the current scope using its AMOS default |
+| `this.context` | Shared state for this program, also supplied to extension translation |
+
+Context state used by commands includes `colorMapping` and `palette` (`PALETTE`),
+`scopes`, `currentScope` and `globalVariablesSet` (`PROCEDURE`, `GLOBAL`), and `hasDataMatrix` (`DATA`). The context also owns loop tracking and runtime
+inclusion. Handlers are standalone classes that store `context` and `expressions` in their
+constructors and call the services directly.
+
+The dispatcher resolves handler names through the node's owning parser. Unhandled tree
+enter/exit events are harmless. An expression rule requiring an unregistered handler raises
+an internal error with the rule name, rather than emitting undefined code.
+
+To read a command's parameters from `ctx`, see [section 5](#5-reading-a-commands-parameters). For
+what the emitted code can use in the browser, see
+[section 6](#6-the-browser-side-the-dom-and-the-runtime).
+
+## 10. Pitfalls
+
+- **Never edit generated parsers.** Change `AMOS.g4` and regenerate both AMOS and AMCAF
+  with `npm run antlr`.
+- **Method names must match the grammar rule exactly** (`enterPlot` for rule `plot`), and each
+  rule is translated in one command file only. A misspelled method is never called: `npm test`
+  catches both mistakes (`tests/command-files.spec.js`).
+- **Order of `statement:`.** ANTLR picks the first alternative that matches, so append new
+  commands at the end unless they must win over an existing one.
+- **Keywords.** Use named lexer tokens exclusively: `PLOT`, `SCREEN_OPEN`, and `PLUS`
+  (the `ADD` token names the command). Keywords precede `IDENTIFIER` and reserve their
+  spelling in every case. Compound tokens use `HSPACE` and a trailing boundary;
+  `LINE_INPUT` uses `FILE_CHANNEL_BOUNDARY` to allow `Line Input#1`. `REM` also has
+  a boundary, so names such as `Remember` remain identifiers.
+- **Identifier case.** After a successful parse, `grammar/normalize-identifiers.js`
+  normalizes variables, arrays, parameters, procedures, and `DEF FN` names to uppercase.
+  String suffixes stay `$`; float identifiers become `NAME_f`. Unsuffixed `Timer`
+  keeps its runtime binding. Label definitions and label references retain their case,
+  and the `label` alternative must precede bare procedure calls. The pass uses the owning
+  parser's token names because imported grammars have different numeric token IDs.
+  AMCAF and mini-parsers that reuse AMOS expressions apply the same pass to their accepted
+  trees. Keyword matching preserves token text, so strings, filenames, AMAL strings,
+  and source positions are unaffected; never uppercase the whole source.
+- **Write each argument as `expression`, with a required `COMMA` between arguments.** An
+  alternative that `expression` already covers (`expression | NUMBER`), or an optional comma
+  (`COMMA? expression?`), makes ANTLR fall back to a much slower prediction, even in other
+  statements: an optional comma in `Rainbow` used to slow down every `A(1)` and `X-1`.
+  `tests/grammar-fast-path.spec.js` checks the common statements.
+- **Error messages.** Adding or moving grammar rules changes the order of the
+  `expecting {…}` list in syntax errors. This is expected.
+- **Formatting.** The generated program is formatted by prettier, so tests must compare against
+  formatted code.
+
+## 11. Checklist
+
+- [ ] Category looked up in the spreadsheet
+- [ ] Grammar rule under its category heading, A-Z, with `// NAME`, and added to `statement:`
+      (instructions, structures) or `factor:` (functions)
+- [ ] Named keyword token above `IDENTIFIER`; compound commands use `HSPACE` and a boundary
+- [ ] `npm run antlr`, and core and extension generated files included with grammar changes
+- [ ] Method in `commands/<category>.js`, A-Z, with `// NAME` above it
+- [ ] `core/amos-runtime.js` checked for helpers the emitted code can reuse
+- [ ] Test in `tests/<command>.spec.js`, and `npm test` passes
+- [ ] Spreadsheet updated (`GRAMMAR SUPPORT`, `SEMANTIC SUPPORT`, `TESTS`)
